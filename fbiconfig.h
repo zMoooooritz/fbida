@@ -37,6 +37,7 @@
 #define O_PAGEFLIP              O_OPTIONS, "pageflip"
 #define O_FONT                  O_OPTIONS, "font"
 #define O_VIDEO_MODE            O_OPTIONS, "video-mode"
+#define O_STATUS_FILE           O_OPTIONS, "status"
 
 #define GET_HELP()		cfg_get_bool(O_HELP,          0)
 #define GET_VERSION()		cfg_get_bool(O_VERSION,       0)

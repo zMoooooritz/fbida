@@ -40,6 +40,12 @@ struct cfg_cmdline fbi_cmd[] = {
 	.needsarg = 1,
 	.desc     = "read image filelist from file <arg>",
     },{
+	.letter   = 's',
+	.cmdline  = "status",
+	.option   = { O_STATUS_FILE },
+	.needsarg = 1,
+	.desc     = "write current image info to file or pipe <arg>",
+    },{
 	.letter   = 'P',
 	.cmdline  = "text",
 	.option   = { O_TEXT_MODE },

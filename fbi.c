@@ -21,6 +21,7 @@
 #include <locale.h>
 #include <wchar.h>
 #include <setjmp.h>
+#include <limits.h>
 #include <sys/time.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -104,6 +105,9 @@ int editable;
 int blend_msecs;
 int perfmon = 0;
 int interactive = 0;
+
+/* status file */
+static char *statusfile = NULL;
 
 /* font handling */
 static char *fontname = NULL;
@@ -419,6 +423,91 @@ static void status_error(unsigned char *msg)
 
     shadow_render(gfx);
     sleep(2);
+}
+
+static void write_status(struct flist *f)
+{
+    FILE *fp;
+    char *realpath_name = NULL;
+    int fd;
+    struct stat st;
+
+    if (!statusfile || !f)
+        return;
+
+    /* Check if statusfile is a FIFO */
+    int is_fifo = 0;
+    if (stat(statusfile, &st) == 0 && S_ISFIFO(st.st_mode)) {
+        is_fifo = 1;
+    }
+
+    if (is_fifo) {
+        /* For FIFO */
+        fd = open(statusfile, O_WRONLY | O_NONBLOCK);
+    } else {
+        /* For normal file */
+        fd = open(statusfile, O_WRONLY | O_CREAT, 0666);
+    }
+    if (fd < 0) {
+        return; /* silently fail - avoid disrupting image viewing */
+    }
+
+    fp = fdopen(fd, "w");
+    if (!fp) {
+        close(fd);
+        return; /* silently fail - avoid disrupting image viewing */
+    }
+
+    /* Get absolute path of current image */
+    realpath_name = realpath(f->name, NULL);
+    const char *path_to_use = realpath_name ? realpath_name : f->name;
+
+    /* Write JSON format */
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"timestamp\": %ld,\n", (long)time(NULL));
+
+    /* Escape JSON string - simple approach for path */
+    fprintf(fp, "  \"image_path\": \"");
+    for (const char *src = path_to_use; *src; src++) {
+        switch (*src) {
+            case '"':  fprintf(fp, "\\\""); break;
+            case '\\': fprintf(fp, "\\\\"); break;
+            case '\b': fprintf(fp, "\\b"); break;
+            case '\f': fprintf(fp, "\\f"); break;
+            case '\n': fprintf(fp, "\\n"); break;
+            case '\r': fprintf(fp, "\\r"); break;
+            case '\t': fprintf(fp, "\\t"); break;
+            default:
+                if (*src < 32) {
+                    fprintf(fp, "\\u%04x", (unsigned char)*src);
+                } else {
+                    fputc(*src, fp);
+                }
+                break;
+        }
+    }
+    fprintf(fp, "\",\n");
+
+    fprintf(fp, "  \"image_number\": %d,\n", f->nr);
+    fprintf(fp, "  \"total_images\": %d,\n", fcount);
+
+    if (f->fimg) {
+        fprintf(fp, "  \"image_width\": %d,\n", f->fimg->i.width);
+        fprintf(fp, "  \"image_height\": %d,\n", f->fimg->i.height);
+        fprintf(fp, "  \"scale_factor\": %.2f,\n", f->scale);
+    } else {
+        fprintf(fp, "  \"image_width\": 0,\n");
+        fprintf(fp, "  \"image_height\": 0,\n");
+        fprintf(fp, "  \"scale_factor\": 0.0,\n");
+    }
+
+    fprintf(fp, "  \"tagged\": %s\n", f->tag ? "true" : "false");
+    fprintf(fp, "}\n");
+
+    fclose(fp);
+
+    if (realpath_name)
+        free(realpath_name);
 }
 
 static void show_exif(struct flist *f)
@@ -771,6 +860,9 @@ svga_show(struct flist *f, struct flist *prev,
 	    }
 	    status_update(desc, info);
 	    shadow_render(gfx);
+
+	    /* Write current image status to file if requested */
+	    write_status(f);
 
 	    if (read_ahead) {
 		struct flist *f = flist_next(fcurrent,1,0);
@@ -1279,6 +1371,7 @@ int main(int argc, char *argv[])
 
     fontname    = cfg_get_str(O_FONT);
     filelist    = cfg_get_str(O_FILE_LIST);
+    statusfile  = cfg_get_str(O_STATUS_FILE);
 
     if (filelist)
 	flist_add_list(filelist);
