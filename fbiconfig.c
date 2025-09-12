@@ -46,6 +46,12 @@ struct cfg_cmdline fbi_cmd[] = {
 	.needsarg = 1,
 	.desc     = "write current image info to file or pipe <arg>",
     },{
+	.letter   = 'c',
+	.cmdline  = "commands",
+	.option   = { O_COMMAND_FILE },
+	.needsarg = 1,
+	.desc     = "read remote control commands from pipe <arg>",
+    },{
 	.letter   = 'P',
 	.cmdline  = "text",
 	.option   = { O_TEXT_MODE },

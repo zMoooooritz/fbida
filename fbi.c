@@ -46,12 +46,14 @@
 
 /* ---------------------------------------------------------------------- */
 
+#define MAX_COMMAND_SIZE 64
+
 /* variables for read_image */
 int32_t         lut_red[256], lut_green[256], lut_blue[256];
 int             pcd_res = 3;
 int             v_steps = 50;
 int             h_steps = 50;
-int             textreading = 0, redraw = 0, statusline = 1;
+int             textreading = 0, redraw = 0, statusline = 1, paused = 0;
 int             fitwidth;
 
 /* file list */
@@ -108,6 +110,10 @@ int interactive = 0;
 
 /* status file */
 static char *statusfile = NULL;
+
+/* command file */
+static char *commandfile = NULL;
+static int command_fd = -1;
 
 /* font handling */
 static char *fontname = NULL;
@@ -501,13 +507,109 @@ static void write_status(struct flist *f)
         fprintf(fp, "  \"scale_factor\": 0.0,\n");
     }
 
-    fprintf(fp, "  \"tagged\": %s\n", f->tag ? "true" : "false");
+    fprintf(fp, "  \"tagged\": %s,\n", f->tag ? "true" : "false");
+    fprintf(fp, "  \"paused\": %s\n", paused ? "true" : "false");
     fprintf(fp, "}\n");
 
     fclose(fp);
 
     if (realpath_name)
         free(realpath_name);
+}
+
+static int init_commands_pipe(void)
+{
+    struct stat st;
+    
+    if (!commandfile)
+        return -1;
+
+    /* Verify it's a FIFO */
+    if (stat(commandfile, &st) < 0) {
+        fprintf(stderr, "ERROR: command file '%s' does not exist\n", commandfile);
+        return -1;
+    }
+    
+    if (!S_ISFIFO(st.st_mode)) {
+        fprintf(stderr, "ERROR: command file '%s' is not a FIFO/pipe\n", commandfile);
+        fprintf(stderr, "       Create it with: mkfifo %s\n", commandfile);
+        return -1;
+    }
+
+    /* Open FIFO non-blocking to avoid hanging if no writer */
+    command_fd = open(commandfile, O_RDONLY | O_NONBLOCK);
+    
+    if (command_fd >= 0) {
+        return 0;
+    } else {
+        fprintf(stderr, "ERROR: Failed to open command FIFO: %s\n", strerror(errno));
+        return -1;
+    }
+}
+
+static void cleanup_commands_pipe(void)
+{
+    if (command_fd >= 0) {
+        close(command_fd);
+        command_fd = -1;
+    }
+}
+
+static int read_command(char *buffer, size_t buffer_size)
+{
+    char line[MAX_COMMAND_SIZE];
+
+    if (command_fd < 0)
+        return 0;
+
+    /* Simple read - try to get one line */
+    ssize_t n = read(command_fd, line, sizeof(line) - 1);
+    
+    if (n <= 0) {
+        if (n == 0) {
+            /* EOF - no writers connected, this is normal */
+            return 0;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* No data available */
+            return 0;
+        } else {
+            /* Real error - close and try to reopen */
+            close(command_fd);
+            command_fd = -1;
+            init_commands_pipe(); /* Try to reopen, ignore errors */
+            return 0;
+        }
+    }
+
+    line[n] = '\0';
+    
+    /* Find first newline and use that as our command */
+    char *newline = strchr(line, '\n');
+    if (newline) {
+        *newline = '\0';  /* Terminate at newline */
+        if (strlen(line) > 0 && strlen(line) < buffer_size) {
+            strcpy(buffer, line);
+            return 1; /* Got command */
+        }
+    }
+
+    return 0; /* No valid command */
+}
+
+static uint32_t parse_command(const char *command)
+{
+    /* Map text commands to key codes */
+    if (strcmp(command, "pause") == 0 || strcmp(command, "unpause") == 0) {
+        return XKB_KEY_P;
+    } else if (strcmp(command, "next") == 0) {
+        return XKB_KEY_Page_Down;
+    } else if (strcmp(command, "prev") == 0) {
+        return XKB_KEY_Page_Up;
+    } else if (strcmp(command, "quit") == 0 || strcmp(command, "exit") == 0) {
+        return XKB_KEY_Q;
+    }
+    
+    return 0; /* Unknown command */
 }
 
 static void show_exif(struct flist *f)
@@ -818,194 +920,234 @@ static int
 svga_show(struct flist *f, struct flist *prev,
 	  int timeout, char *desc, char *info, int *nr)
 {
-    static int        paused = 0, skip = -1;
+    static int        skip = -1;
+    static time_t     last_advance = 0;
 
     struct ida_image  *img = flist_img_get(f);
     int               exif = 0, help = 0;
     int               rc;
     char              key[16];
-    uint32_t          keycode, keymod;
+    uint32_t          keycode = 0, keymod = 0;
+    int               remote_command = 0;
     char              linebuffer[80];
 
     *nr = 0;
     if (NULL == img)
-	return skip;
+	    return skip;
 
     redraw = 1;
     for (;;) {
-	if (redraw) {
-	    redraw = 0;
-	    if (img->i.height <= gfx->vdisplay) {
-		f->top = 0;
-	    } else {
-		if (f->top < 0)
-		    f->top = 0;
-		if (f->top + gfx->vdisplay > img->i.height)
-		    f->top = img->i.height - gfx->vdisplay;
-	    }
-	    if (img->i.width <= gfx->hdisplay) {
-		f->left = 0;
-	    } else {
-		if (f->left < 0)
-		    f->left = 0;
-		if (f->left + gfx->hdisplay > img->i.width)
-		    f->left = img->i.width - gfx->hdisplay;
-	    }
-	    if (blend_msecs && prev && prev != f &&
-		flist_img_get(prev) && flist_img_get(f)) {
-		effect_blend(prev, f);
-		prev = NULL;
-	    } else {
-		shadow_draw_image(img, f->left, f->top, 0, gfx->vdisplay-1, 100);
-	    }
-	    status_update(desc, info);
-	    shadow_render(gfx);
+        if (redraw) {
+            redraw = 0;
+            if (img->i.height <= gfx->vdisplay) {
+                f->top = 0;
+            } else {
+                if (f->top < 0)
+                    f->top = 0;
+                if (f->top + gfx->vdisplay > img->i.height)
+                    f->top = img->i.height - gfx->vdisplay;
+            }
+            if (img->i.width <= gfx->hdisplay) {
+                f->left = 0;
+            } else {
+                if (f->left < 0)
+                    f->left = 0;
+                if (f->left + gfx->hdisplay > img->i.width)
+                    f->left = img->i.width - gfx->hdisplay;
+            }
+            if (blend_msecs && prev && prev != f &&
+                flist_img_get(prev) && flist_img_get(f)) {
+                effect_blend(prev, f);
+                prev = NULL;
+            } else {
+                shadow_draw_image(img, f->left, f->top, 0, gfx->vdisplay-1, 100);
+            }
+            status_update(desc, info);
+            shadow_render(gfx);
 
-	    /* Write current image status to file if requested */
-	    write_status(f);
+            /* Write current image status to file if requested */
+            write_status(f);
 
-	    if (read_ahead) {
-		struct flist *f = flist_next(fcurrent,1,0);
-		if (f && !f->fimg)
-		    flist_img_load(f,1);
-		status_update(desc, info);
-		shadow_render(gfx);
-	    }
-	}
+            if (read_ahead) {
+                struct flist *f = flist_next(fcurrent,1,0);
+                if (f && !f->fimg)
+                    flist_img_load(f,1);
+                status_update(desc, info);
+                shadow_render(gfx);
+            }
+        }
         if (check_console_switch()) {
-	    continue;
-	}
+	        continue;
+	    }
 
-	if (!interactive) {
-	    sleep(timeout);
-	    return -1;
-	}
-
-        rc = kbd_wait(paused ? 0 : timeout);
-        if (check_console_switch()) {
-	    continue;
-	}
-	if (rc < 1)
-	    return -1; /* timeout */
-
-        rc = kbd_read(key, sizeof(key), &keycode, &keymod);
-        if (rc < 0)
-            return XKB_KEY_Escape; /* EOF */
+        /* Exclusive input method handling */
+        if (interactive) {
+            /* Interactive mode - keyboard input only */
+            rc = kbd_wait(paused ? 0 : timeout);
+            if (check_console_switch()) {
+                continue;
+            }
+            if (rc < 1) {
+                /* Timeout - advance to next image if not paused */
+                return paused ? 0 : -1;
+            }
+            rc = kbd_read(key, sizeof(key), &keycode, &keymod);
+            if (rc < 0)
+                return XKB_KEY_Escape; /* EOF */
+                
+        } else if (command_fd >= 0) {
+            /* Command file mode - remote commands only */
+            char cmd_buffer[MAX_COMMAND_SIZE];
+            rc = read_command(cmd_buffer, sizeof(cmd_buffer));
+            if (rc > 0) {
+                keycode = parse_command(cmd_buffer);
+                remote_command = 1;
+            } else {
+                /* No command available, short sleep and continue */
+                usleep(100000); /* 100ms */
+                if (!paused) {
+                    time_t now = time(NULL);
+                    /* Initialize last_advance on first call */
+                    if (last_advance == 0) {
+                        last_advance = now;
+                    }
+                    if (now - last_advance >= timeout) {
+                        last_advance = now;
+                        return -1; /* advance to next image */
+                    }
+                }
+                continue;
+            }
+            
+        } else {
+            /* Non-interactive, no command file - slideshow mode */
+            if (!paused) {
+                sleep(timeout);
+                return -1; /* advance to next image */
+            } else {
+                /* Paused slideshow - just wait */
+                sleep(1);
+                continue;
+            }
+        }
 
         switch (keycode) {
-        case XKB_KEY_space:
-	    if (textreading && f->top < (int)(img->i.height - gfx->vdisplay)) {
-		redraw = 1;
-		f->top += f->text_steps;
-	    } else {
-		skip = XKB_KEY_space;
-		return XKB_KEY_space;
-	    }
-            break;
-
-        case XKB_KEY_UP:
-	    redraw = 1;
-	    f->top -= v_steps;
-            break;
-        case XKB_KEY_DOWN:
-	    redraw = 1;
-	    f->top += v_steps;
-            break;
-        case XKB_KEY_Home:
-	    redraw = 1;
-	    f->top = 0;
-            break;
-        case XKB_KEY_End:
-	    redraw = 1;
-	    f->top = img->i.height - gfx->vdisplay;
-            break;
-        case XKB_KEY_Left:
-	    redraw = 1;
-	    f->left -= h_steps;
-            break;
-        case XKB_KEY_Right:
-	    redraw = 1;
-	    f->left += h_steps;
-            break;
-
-        case XKB_KEY_Page_Up:
-        case XKB_KEY_K:
-	    if (textreading && f->top > 0) {
-		redraw = 1;
-		f->top -= f->text_steps;
-	    } else {
-		skip = XKB_KEY_Page_Up;
-		return XKB_KEY_Page_Up;
-	    }
-            break;
-        case XKB_KEY_Page_Down:
-        case XKB_KEY_J:
-        case XKB_KEY_N:
-	    if (textreading && f->top < (int)(img->i.height - gfx->vdisplay)) {
-		redraw = 1;
-		f->top += f->text_steps;
-	    } else {
-		skip = XKB_KEY_Page_Down;
-		return XKB_KEY_Page_Down;
-	    }
-            break;
-
-        case XKB_KEY_P:
-	    if (0 != timeout) {
-		paused = !paused;
-		status_update(paused ? "pause on " : "pause off", NULL);
-	    }
-            break;
-
-        case XKB_KEY_H:
-	    if (!help) {
-		show_help();
-		help = 1;
-	    } else {
-		redraw = 1;
-		help = 0;
-	    }
-	    exif = 0;
-            break;
-
-        case XKB_KEY_I:
-	    if (!exif) {
-		show_exif(fcurrent);
-		exif = 1;
-	    } else {
-		redraw = 1;
-		exif = 0;
-	    }
-	    help = 0;
-            break;
-
-        case XKB_KEY_0:
-        case XKB_KEY_1:
-        case XKB_KEY_2:
-        case XKB_KEY_3:
-        case XKB_KEY_4:
-        case XKB_KEY_5:
-        case XKB_KEY_6:
-        case XKB_KEY_7:
-        case XKB_KEY_8:
-        case XKB_KEY_9:
-	    *nr = *nr * 10;
-            if (keycode != XKB_KEY_0)
-                *nr += keycode - XKB_KEY_1 + 1;
-	    snprintf(linebuffer, sizeof(linebuffer), "> %d",*nr);
-	    status_update(linebuffer, NULL);
-            break;
-
-        case XKB_KEY_D:
-            /* need shift state for this one */
-            return XKB_KEY_D | (keymod << 16);
-
-        case XKB_KEY_VoidSymbol:
-            /* ignored event */
-            break;
-
-        default:
-            return keycode;
+            case XKB_KEY_space:
+                if (textreading && f->top < (int)(img->i.height - gfx->vdisplay)) {
+                    redraw = 1;
+                    f->top += f->text_steps;
+                } else {
+                    skip = XKB_KEY_space;
+                    return XKB_KEY_space;
+                }
+                break;
+            case XKB_KEY_UP:
+                redraw = 1;
+                f->top -= v_steps;
+                break;
+            case XKB_KEY_DOWN:
+                redraw = 1;
+                f->top += v_steps;
+                break;
+            case XKB_KEY_Home:
+                redraw = 1;
+                f->top = 0;
+                break;
+            case XKB_KEY_End:
+                redraw = 1;
+                f->top = img->i.height - gfx->vdisplay;
+                break;
+            case XKB_KEY_Left:
+                redraw = 1;
+                f->left -= h_steps;
+                break;
+            case XKB_KEY_Right:
+                redraw = 1;
+                f->left += h_steps;
+                break;
+            case XKB_KEY_Page_Up:
+            case XKB_KEY_K:
+                /* Force advance for remote commands, otherwise check text scrolling */
+                if (remote_command || !(textreading && f->top > 0)) {
+                    /* Reset advance timer for remote navigation commands */
+                    if (remote_command && timeout > 0) {
+                        paused = 1;
+                    }
+                    skip = XKB_KEY_Page_Up;
+                    return XKB_KEY_Page_Up;
+                } else {
+                    redraw = 1;
+                    f->top -= f->text_steps;
+                }
+                break;
+            case XKB_KEY_Page_Down:
+            case XKB_KEY_J:
+            case XKB_KEY_N:
+                /* Force advance for remote commands, otherwise check text scrolling */
+                if (remote_command || !(textreading && f->top < (int)(img->i.height - gfx->vdisplay))) {
+                    /* Reset advance timer for remote navigation commands */
+                    if (remote_command && timeout > 0) {
+                        paused = 1;
+                    }
+                    skip = XKB_KEY_Page_Down;
+                    return XKB_KEY_Page_Down;
+                } else {
+                    redraw = 1;
+                    f->top += f->text_steps;
+                }
+                break;
+            case XKB_KEY_P:
+                if (0 != timeout) {
+                    paused = !paused;
+                    last_advance = time(NULL);
+                    status_update(paused ? "pause on " : "pause off", NULL);
+                    write_status(f);
+                }
+                break;
+            case XKB_KEY_H:
+                if (!help) {
+                    show_help();
+                    help = 1;
+                } else {
+                    redraw = 1;
+                    help = 0;
+                }
+                exif = 0;
+                break;
+            case XKB_KEY_I:
+                if (!exif) {
+                    show_exif(fcurrent);
+                    exif = 1;
+                } else {
+                    redraw = 1;
+                    exif = 0;
+                }
+                help = 0;
+                break;
+            case XKB_KEY_0:
+            case XKB_KEY_1:
+            case XKB_KEY_2:
+            case XKB_KEY_3:
+            case XKB_KEY_4:
+            case XKB_KEY_5:
+            case XKB_KEY_6:
+            case XKB_KEY_7:
+            case XKB_KEY_8:
+            case XKB_KEY_9:
+                *nr += *nr * 10;
+                if (keycode != XKB_KEY_0)
+                    *nr += keycode - XKB_KEY_1 + 1;
+                snprintf(linebuffer, sizeof(linebuffer), "> %d",*nr);
+                status_update(linebuffer, NULL);
+                break;
+            case XKB_KEY_D:
+                /* need shift state for this one */
+                return XKB_KEY_D | (keymod << 16);
+            case XKB_KEY_VoidSymbol:
+                /* ignored event */
+                break;
+            default:
+                return keycode;
         }
     }
 }
@@ -1282,6 +1424,7 @@ static void exit_signals_init(void)
 
 static void cleanup_and_exit(int code)
 {
+    cleanup_commands_pipe();
     shadow_fini();
     kbd_fini();
     gfx->cleanup_display();
@@ -1372,6 +1515,14 @@ int main(int argc, char *argv[])
     fontname    = cfg_get_str(O_FONT);
     filelist    = cfg_get_str(O_FILE_LIST);
     statusfile  = cfg_get_str(O_STATUS_FILE);
+    commandfile = cfg_get_str(O_COMMAND_FILE);
+
+    /* Validate exclusive input methods */
+    if (interactive && commandfile) {
+        fprintf(stderr, "ERROR: Cannot use both interactive mode and commands pipe.\n");
+        fprintf(stderr, "       Choose either --interactive OR --commands, not both.\n");
+        exit(1);
+    }
 
     if (filelist)
 	flist_add_list(filelist);
@@ -1436,6 +1587,14 @@ int main(int argc, char *argv[])
         fprintf(stderr, "ERROR: failed to open input devices (%d ok, %d failed)\n",
                 libinput_devcount, libinput_deverror);
         cleanup_and_exit(0);
+    }
+
+    /* Initialize command file for remote control */
+    if (commandfile) {
+        if (init_commands_pipe() < 0) {
+            fprintf(stderr, "WARNING: failed to open commands pipe '%s': %s\n", 
+                    commandfile, strerror(errno));
+        }
     }
 
     /* svga main loop */
