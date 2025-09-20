@@ -402,15 +402,58 @@ static void status_update(unsigned char *desc, char *info)
     char str[128];
 
     if (!statusline)
-	return;
+    {
+	    return;
+    }
     status_prepare();
 
-    snprintf(str,ARRAY_SIZE(str),"%s",desc);
-    shadow_draw_string(0, yt, str, -1);
-    if (info) {
-	snprintf(str,ARRAY_SIZE(str), "[ %s ] H - Help", info);
+    // If desc contains "/" it is a path
+    // in this case extract the filename and parent directory
+    if (desc && strchr((const char *)desc, '/')) {
+        const char *last_slash = strrchr((const char *)desc, '/');
+        const char *filename = last_slash ? last_slash + 1 : (const char *)desc;
+        char parent_dir[64] = {0};
+        
+        if (last_slash && last_slash > (const char *)desc) {
+            // Find the second-to-last slash to get parent directory
+            const char *second_last_slash = NULL;
+            for (const char *p = (const char *)desc; p < last_slash; p++) {
+                if (*p == '/') {
+                    second_last_slash = p;
+                }
+            }
+            
+            const char *parent_start;
+            if (second_last_slash) {
+                parent_start = second_last_slash + 1;
+            } else {
+                // No second slash found, use from beginning (skip leading / if present)
+                parent_start = (desc[0] == '/') ? (const char *)desc + 1 : (const char *)desc;
+            }
+            
+            size_t len = last_slash - parent_start;
+            if (len > 0 && len < sizeof(parent_dir)) {
+                strncpy(parent_dir, parent_start, len);
+                parent_dir[len] = '\0';
+            }
+        }
+        
+        if (parent_dir[0]) {
+            snprintf(str, ARRAY_SIZE(str), "DIR: %s IMG: %s", parent_dir, filename);
+            desc = (unsigned char *)str;
+        } else {
+            snprintf(str, ARRAY_SIZE(str), "IMG: %s", filename);
+            desc = (unsigned char *)str;
+        }
     } else {
-	snprintf(str,ARRAY_SIZE(str), "| H - Help");
+        snprintf(str, ARRAY_SIZE(str), "%s", desc);
+    }
+    shadow_draw_string(0, yt, str, -1);
+
+    if (info) {
+        snprintf(str, ARRAY_SIZE(str), "[ %s ]", info);
+    } else {
+        snprintf(str, ARRAY_SIZE(str), "%s", "");
     }
     shadow_draw_string(gfx->hdisplay, yt, str, 1);
 
@@ -508,7 +551,8 @@ static void write_status(struct flist *f)
     }
 
     fprintf(fp, "  \"tagged\": %s,\n", f->tag ? "true" : "false");
-    fprintf(fp, "  \"paused\": %s\n", paused ? "true" : "false");
+    fprintf(fp, "  \"paused\": %s,\n", paused ? "true" : "false");
+    fprintf(fp, "  \"statusline\": %s\n", statusline ? "true" : "false");
     fprintf(fp, "}\n");
 
     fclose(fp);
@@ -607,6 +651,8 @@ static uint32_t parse_command(const char *command)
         return XKB_KEY_Page_Up;
     } else if (strcmp(command, "quit") == 0 || strcmp(command, "exit") == 0) {
         return XKB_KEY_Q;
+    } else if (strcmp(command, "statusline") == 0) {
+        return XKB_KEY_V;
     }
     
     return 0; /* Unknown command */
@@ -896,7 +942,7 @@ static void effect_blend(struct flist *f, struct flist *t)
 	if (perfmon) {
 	    pos += snprintf(linebuffer+pos, sizeof(linebuffer)-pos,
 			    " %d%%", weight);
-	    status_update(linebuffer, NULL);
+	    // status_update(linebuffer, NULL);
 	    count++;
 	}
 
@@ -910,7 +956,7 @@ static void effect_blend(struct flist *f, struct flist *t)
 	pos += snprintf(linebuffer+pos, sizeof(linebuffer)-pos,
 			" | %d/%d -> %d msec",
 			msecs, count, msecs/count);
-	status_update(linebuffer, NULL);
+	// status_update(linebuffer, NULL);
 	shadow_render(gfx);
 	sleep(2);
     }
@@ -1100,7 +1146,7 @@ svga_show(struct flist *f, struct flist *prev,
                 if (0 != timeout) {
                     paused = !paused;
                     last_advance = time(NULL);
-                    status_update(paused ? "pause on " : "pause off", NULL);
+                    // status_update(paused ? "pause on " : "pause off", NULL);
                     write_status(f);
                 }
                 break;
@@ -1138,7 +1184,7 @@ svga_show(struct flist *f, struct flist *prev,
                 if (keycode != XKB_KEY_0)
                     *nr += keycode - XKB_KEY_1 + 1;
                 snprintf(linebuffer, sizeof(linebuffer), "> %d",*nr);
-                status_update(linebuffer, NULL);
+                // status_update(linebuffer, NULL);
                 break;
             case XKB_KEY_D:
                 /* need shift state for this one */
@@ -1310,7 +1356,7 @@ static void flist_img_scale(struct flist *f, float scale, int prefetch)
 	    snprintf(linebuffer, sizeof(linebuffer),
 		     "scaling (%.0f%%) %s ...",
 		     scale*100, f->name);
-	    status_update(linebuffer, NULL);
+	    // status_update(linebuffer, NULL);
 	}
 	f->simg = scale_image(f->fimg,scale);
 	if (!f->simg) {
@@ -1336,7 +1382,7 @@ static void flist_img_load(struct flist *f, int prefetch)
 
     snprintf(linebuffer,sizeof(linebuffer),"%s %s ...",
 	     prefetch ? "prefetch" : "loading", f->name);
-    status_update(linebuffer, NULL);
+    // status_update(linebuffer, NULL);
     f->fimg = read_image(f->name);
     if (!f->fimg) {
 	snprintf(linebuffer,sizeof(linebuffer),
@@ -1656,7 +1702,7 @@ int main(int argc, char *argv[])
 	    if (editable) {
 		snprintf(linebuffer,sizeof(linebuffer),
 			 "rotating %s ...",fcurrent->name);
-		status_update(linebuffer, NULL);
+		// status_update(linebuffer, NULL);
 		jpeg_transform_inplace
 		    (fcurrent->name,
 		     (key == XKB_KEY_R) ? JXFORM_ROT_90 : JXFORM_ROT_270,
@@ -1680,7 +1726,7 @@ int main(int argc, char *argv[])
 	    if (editable) {
 		snprintf(linebuffer,sizeof(linebuffer),
 			 "mirroring %s ...",fcurrent->name);
-		status_update(linebuffer, NULL);
+		// status_update(linebuffer, NULL);
 		jpeg_transform_inplace
 		    (fcurrent->name,
 		     (key == XKB_KEY_X) ? JXFORM_FLIP_V : JXFORM_FLIP_H,
@@ -1764,6 +1810,7 @@ int main(int argc, char *argv[])
 #endif
 	case XKB_KEY_V:
 	    statusline = !statusline;
+        write_status(fcurrent);
 	    break;
 	}
     }
